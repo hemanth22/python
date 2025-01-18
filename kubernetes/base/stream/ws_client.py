@@ -26,10 +26,11 @@ import time
 import six
 import yaml
 
-from six.moves.urllib.parse import urlencode, urlparse, urlunparse
-from six import StringIO
 
-from websocket import WebSocket, ABNF, enableTrace
+from six.moves.urllib.parse import urlencode, urlparse, urlunparse
+from six import StringIO, BytesIO
+
+from websocket import WebSocket, ABNF, enableTrace, WebSocketConnectionClosedException
 from base64 import urlsafe_b64decode
 from requests.utils import should_bypass_proxies
 
@@ -48,7 +49,7 @@ class _IgnoredIO:
 
 
 class WSClient:
-    def __init__(self, configuration, url, headers, capture_all):
+    def __init__(self, configuration, url, headers, capture_all, binary=False):
         """A websocket client with support for channels.
 
             Exec command uses different channels for different streams. for
@@ -58,8 +59,10 @@ class WSClient:
         """
         self._connected = False
         self._channels = {}
+        self.binary = binary
+        self.newline = '\n' if not self.binary else b'\n'
         if capture_all:
-            self._all = StringIO()
+            self._all = StringIO() if not self.binary else BytesIO()
         else:
             self._all = _IgnoredIO()
         self.sock = create_websocket(configuration, url, headers)
@@ -92,8 +95,8 @@ class WSClient:
         while self.is_open() and time.time() - start < timeout:
             if channel in self._channels:
                 data = self._channels[channel]
-                if "\n" in data:
-                    index = data.find("\n")
+                if self.newline in data:
+                    index = data.find(self.newline)
                     ret = data[:index]
                     data = data[index+1:]
                     if data:
@@ -182,6 +185,8 @@ class WSClient:
         if hasattr(select, "poll"):
             poll = select.poll()
             poll.register(self.sock.sock, select.POLLIN)
+            if timeout is not None:
+                timeout *= 1_000  # poll method uses milliseconds as the time unit
             r = poll.poll(timeout)
             poll.unregister(self.sock.sock)
         else:
@@ -195,10 +200,12 @@ class WSClient:
                 return
             elif op_code == ABNF.OPCODE_BINARY or op_code == ABNF.OPCODE_TEXT:
                 data = frame.data
-                if six.PY3:
+                if six.PY3 and not self.binary:
                     data = data.decode("utf-8", "replace")
                 if len(data) > 1:
-                    channel = ord(data[0])
+                    channel = data[0]
+                    if six.PY3 and not self.binary:
+                        channel = ord(channel)
                     data = data[1:]
                     if data:
                         if channel in [STDOUT_CHANNEL, STDERR_CHANNEL]:
@@ -256,7 +263,7 @@ class PortForward:
 
         Port Forward command sends on 2 channels per port, a read/write
         data channel and a read only error channel. Both channels are sent an
-        initial frame contaning the port number that channel is associated with.
+        initial frame containing the port number that channel is associated with.
         """
 
         self.websocket = websocket
@@ -372,7 +379,12 @@ class PortForward:
                 if sock == self.websocket:
                     pending = True
                     while pending:
-                        opcode, frame = self.websocket.recv_data_frame(True)
+                        try:
+                            opcode, frame = self.websocket.recv_data_frame(True)
+                        except WebSocketConnectionClosedException:
+                            for port in self.local_ports.values():
+                                port.python.close()
+                            return
                         if opcode == ABNF.OPCODE_BINARY:
                             if not frame.data:
                                 raise RuntimeError("Unexpected frame data size")
@@ -473,6 +485,8 @@ def create_websocket(configuration, url, headers=None):
         ssl_opts['certfile'] = configuration.cert_file
     if configuration.key_file:
         ssl_opts['keyfile'] = configuration.key_file
+    if configuration.tls_server_name:
+        ssl_opts['server_hostname'] = configuration.tls_server_name
 
     websocket = WebSocket(sslopt=ssl_opts, skip_utf8_validation=False)
     connect_opt = {
@@ -514,13 +528,17 @@ def websocket_call(configuration, _method, url, **kwargs):
     _request_timeout = kwargs.get("_request_timeout", 60)
     _preload_content = kwargs.get("_preload_content", True)
     capture_all = kwargs.get("capture_all", True)
-
+    binary = kwargs.get('binary', False)
     try:
-        client = WSClient(configuration, url, headers, capture_all)
+        client = WSClient(configuration, url, headers, capture_all, binary=binary)
         if not _preload_content:
             return client
         client.run_forever(timeout=_request_timeout)
-        return WSResponse('%s' % ''.join(client.read_all()))
+        all = client.read_all()
+        if binary:
+            return WSResponse(all)
+        else:
+            return WSResponse('%s' % ''.join(all))
     except (Exception, KeyboardInterrupt, SystemExit) as e:
         raise ApiException(status=0, reason=str(e))
 

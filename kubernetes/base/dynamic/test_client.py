@@ -468,6 +468,11 @@ class TestDynamicClient(unittest.TestCase):
             name=name, namespace='default', label_selector="e2e-test=true")
         self.assertEqual(name, resp.metadata.name)
 
+        count = 0
+        for _ in client.watch(api, timeout=10, namespace="default", name=name):
+            count += 1
+        self.assertTrue(count > 0, msg="no events received for watch")
+
         test_configmap['data']['config.json'] = "{}"
         resp = api.patch(
             name=name, namespace='default', body=test_configmap)
@@ -563,5 +568,4 @@ class TestDynamicClientSerialization(unittest.TestCase):
         res = ResourceField(params=params)
         self.assertEqual(res["foo"], params["foo"])
         self.assertEqual(res["self"], params["self"])
-        # method will return original object when it doesn't know how to proceed
-        self.assertEqual(self.client.serialize_body(res), res)
+        self.assertEqual(self.client.serialize_body(res), params)
